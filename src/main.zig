@@ -2,6 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const net = Io.net;
+const message_util = @import("message.zig");
+const Producer = @import("producer.zig").Producer;
 
 // Local import
 const Broker = @import("broker.zig").Broker;
@@ -22,17 +24,13 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[1], "server")) {
         var broker = Broker.init();
         try broker.startBrokerServer(io);
+    } else if (std.mem.eql(u8, args[1], "producer")) {
+        const port_int: u16 = try std.fmt.parseInt(u16, args[2], 10);
+        var producer = Producer.init(port_int);
+        try producer.startProducerServer(io);
     } else {
-        // Parse port at 2nd argument
         try clientConnectTCPAndEcho(io, 10000);
     }
-}
-
-pub fn writeEchoToStream(stream_wr: *net.Stream.Writer, data: []u8) !void {
-    try stream_wr.interface.writeByte(@intCast(data.len + 1)); // Send how many byte written
-    try stream_wr.interface.writeByte(1); // Send echo command
-    try stream_wr.interface.writeAll(data);
-    try stream_wr.interface.flush();
 }
 
 /// Test echo function
@@ -60,11 +58,11 @@ pub fn clientConnectTCPAndEcho(io: Io, port: u16) !void {
         }
     };
     std.debug.print("Sent to server: {s}\n", .{line});
-    try writeEchoToStream(&stream_wr, line);
+    try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+        .ECHO = line,
+    });
     // Try to read back from the stream
-    const header = try stream_rd.interface.takeByte(); // TODO: End of stream error handling
-    if (header != 0) {
-        const data = try stream_rd.interface.take(header);
-        std.debug.print("Received from server: {s}\n", .{data});
+    if (try message_util.readMessageFromStream(&stream_rd)) |data| {
+        std.debug.print("Received from server: {s}\n", .{data.R_ECHO});
     }
 }
