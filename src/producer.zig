@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const message_util = @import("message.zig");
+const ProducerRegisterMessage = message_util.ProducerRegisterMessage;
 
 const BROKER_PORT: u16 = 10000;
 
@@ -9,12 +10,14 @@ pub const Producer = struct {
     const Self = @This();
 
     port: u16,
+    topicID: u16,
     read_buffer: [1024]u8,
     write_buffer: [1024]u8,
 
-    pub fn init(port: u16) Self {
+    pub fn init(port: u16, topicID: u16) Self {
         return Self{
             .port = port,
+            .topicID = topicID,
             .read_buffer = undefined,
             .write_buffer = undefined,
         };
@@ -28,10 +31,10 @@ pub const Producer = struct {
         // Send register message to broker
         var stream_rd = stream.reader(io, &self.read_buffer);
         var stream_wr = stream.writer(io, &self.write_buffer);
-        const port_str = try std.fmt.allocPrint(std.heap.page_allocator, "{}", .{self.port});
-        std.debug.print("Sent to server the port: {s}\n", .{port_str});
+        const p_reg = ProducerRegisterMessage{ .port = self.port, .topicID = self.topicID };
+        std.debug.print("Sent to server the port: {}, topic: {}\n", .{ self.port, self.topicID });
         try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-            .P_REG = port_str,
+            .P_REG = p_reg,
         });
         // Try to read back the response from broker
         if (try message_util.readMessageFromStream(&stream_rd)) |res| {
@@ -41,11 +44,12 @@ pub const Producer = struct {
     }
 
     pub fn startProducerServer(self: *Self, io: Io) !void {
-        try self.sendPortDataToBroker(io);
-
         // Create TCP server
         const addr = try net.IpAddress.parse("127.0.0.1", self.port);
         var server = try addr.listen(io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true });
+
+        try self.sendPortDataToBroker(io);
+
         const stream = try server.accept(io); // Blocking until accepted
 
         // Read input from stdin and write to stream.
@@ -68,11 +72,11 @@ pub const Producer = struct {
             };
             std.debug.print("Sent to broker: {s}\n", .{line});
             try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-                .ECHO = line,
+                .PCM = line,
             });
             // Try to read back from the stream
             if (try message_util.readMessageFromStream(&stream_rd)) |data| {
-                std.debug.print("Received from broker: {s}\n", .{data.R_ECHO});
+                std.debug.print("Receive R_PCM from broker: {}\n", .{data.R_PCM});
             }
         }
     }

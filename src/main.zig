@@ -22,11 +22,12 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     if (std.mem.eql(u8, args[1], "server")) {
-        var broker = Broker.init();
+        var broker = try Broker.init();
         try broker.startBrokerServer(io);
     } else if (std.mem.eql(u8, args[1], "producer")) {
         const port_int: u16 = try std.fmt.parseInt(u16, args[2], 10);
-        var producer = Producer.init(port_int);
+        const topic_int: u16 = try std.fmt.parseInt(u16, args[3], 10);
+        var producer = Producer.init(port_int, topic_int);
         try producer.startProducerServer(io);
     } else {
         try clientConnectTCPAndEcho(io, 10000);
