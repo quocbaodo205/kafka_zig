@@ -25,11 +25,34 @@ pub fn Queue(comptime message_size: comptime_int, comptime queue_max_size: compt
             self.tail %= total_size;
         }
 
-        pub fn pop(self: *Self) []u8 {
+        pub fn pop(self: *Self) ?[]u8 {
+            if (self.head == self.tail) {
+                return null;
+            }
             const len = self.under_size[self.head];
             const data = self.under_arr[self.head .. self.head + len];
             self.head += message_size;
             self.head %= total_size;
+            return data;
+        }
+
+        pub fn peek(self: *Self, offset: u32) ?[]u8 {
+            if (self.head == self.tail) {
+                return null;
+            }
+            var position: u32 = self.head +% (offset * message_size);
+            position %= total_size;
+            if (self.head < self.tail) {
+                if (!(position >= self.head and position < self.tail)) {
+                    return null;
+                }
+            } else {
+                if (!(position >= self.head or position < self.tail)) {
+                    return null;
+                }
+            }
+            const len = self.under_size[position];
+            const data = self.under_arr[position .. position + len];
             return data;
         }
 
