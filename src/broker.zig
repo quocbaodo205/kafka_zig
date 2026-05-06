@@ -31,12 +31,12 @@ pub const Broker = struct {
         // Shortcut for socket + bind in network using IPv4
         const addr = try net.IpAddress.parse("127.0.0.1", BROKER_PORT);
         var server = try addr.listen(io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true });
+        var stream_read_buff: [1024]u8 = undefined;
+        var stream_write_buff: [1024]u8 = undefined;
+
         while (true) {
             const stream = try server.accept(io); // Blocking until accepted
 
-            // On accept, create internal buffers and readers
-            var stream_read_buff: [1024]u8 = undefined;
-            var stream_write_buff: [1024]u8 = undefined;
             var stream_rd = stream.reader(io, &stream_read_buff);
             var stream_wr = stream.writer(io, &stream_write_buff);
 
@@ -54,9 +54,37 @@ pub const Broker = struct {
         }
     }
 
-    fn processProducerPCM(_: *Self, pcm: []const u8, topic: *Topic) !u8 {
-        topic.mq.push(pcm);
-        topic.mq.debug();
+    fn processProducerPCM(_: *Self, io: Io, pcm: []const u8, topic: *Topic) !u8 {
+        // If there are no cgroups yet, store in topic's mq
+        if (topic.cgroups.items.len == 0) {
+            topic.mq.push(pcm);
+            return 0;
+        }
+
+        for (topic.cgroups.items) |cg| {
+            var min_size: u32 = 1000000;
+            var target_partition_idx: ?usize = null;
+            for (cg.partitions.items, 0..) |partition, idx| {
+                const current_size = partition.queue.size();
+                if (current_size < min_size) {
+                    min_size = current_size;
+                    target_partition_idx = idx;
+                }
+            }
+            if (target_partition_idx != null) {
+                const target_partition = &cg.partitions.items[target_partition_idx.?];
+                try target_partition.lock.lock(io);
+                defer target_partition.lock.unlock(io);
+
+                // First, dump all messages from topic's mq to this partition
+                while (topic.mq.pop()) |msg_from_mq| {
+                    target_partition.queue.push(msg_from_mq);
+                }
+
+                target_partition.queue.push(pcm);
+            }
+        }
+
         return 0;
     }
 
@@ -108,7 +136,6 @@ pub const Broker = struct {
             tp.* = try Topic.init(p_reg_message.topicID, self.gpa);
             try self.topics.append(self.gpa, tp);
             topic = tp;
-            _ = try io.concurrent(stopAndPop, .{ topic.?, io });
         }
         // Connect to it concurrently and process
         _ = try io.concurrent(connectAndReceiveProducer, .{ io, p_reg_message, self, topic.? });
@@ -131,7 +158,7 @@ pub const Broker = struct {
             topic = tp;
         }
         var cgroup: ?*CGroup = null;
-        topic.?.lock.lockUncancelable(io);
+        try topic.?.lock.lock(io);
         defer topic.?.lock.unlock(io);
         for (topic.?.cgroups.items) |cg| {
             if (cg.groupID == c_reg_message.groupID) {
@@ -144,100 +171,69 @@ pub const Broker = struct {
             cg.* = try CGroup.init(self.gpa, c_reg_message.groupID);
             try topic.?.cgroups.append(self.gpa, cg);
             cgroup = cg;
-            _ = try io.concurrent(startConsumerGroupConsumption, .{ topic.?, cgroup.?, io });
         }
         // Now connect to consumer and add to cgroup
         const addr = try net.IpAddress.parse("127.0.0.1", c_reg_message.port);
         const stream = try addr.connect(io, .{ .mode = .stream, .protocol = .tcp });
         std.debug.print("Connected to consumer at port {}\n", .{c_reg_message.port});
-        const consumer = ConsumerConn{
+        const consumer_ptr = try self.gpa.create(ConsumerConn);
+        consumer_ptr.* = ConsumerConn{
             .status = true,
             .stream = stream,
         };
-        try cgroup.?.consumers.append(self.gpa, consumer);
+        try cgroup.?.lock.lock(io);
+        defer cgroup.?.lock.unlock(io);
+        try cgroup.?.consumer_conn.append(self.gpa, consumer_ptr);
+        if (cgroup.?.partitions.items.len < cgroup.?.consumer_conn.items.len) {
+            try cgroup.?.partitions.append(self.gpa, @import("partition.zig").Partition.init());
+        }
+        std.debug.print("Starting readConsumerReadyAndSend for group {} partition {}\n", .{ cgroup.?.groupID, cgroup.?.partitions.items.len - 1 });
+        _ = try io.concurrent(readConsumerReadyAndSend, .{ io, topic.?, cgroup.?, consumer_ptr, cgroup.?.partitions.items.len - 1 });
         return 0;
     }
 };
 
-fn stopAndPop(topic: *Topic, io: Io) void {
-    while (true) {
-        io.sleep(Io.Duration.fromSeconds(5), .boot) catch {};
-        topic.lock.lockUncancelable(io);
-        var min_offset: i32 = -1;
-        for (topic.cgroups.items) |cg| {
-            if (min_offset == -1) {
-                min_offset = @intCast(cg.offset);
-            } else {
-                if (cg.offset < @as(u32, @intCast(min_offset))) {
-                    min_offset = @intCast(cg.offset);
-                }
-            }
-        }
-        std.debug.print("Stop and pop run, minOffset = {}\n", .{min_offset});
-        if (min_offset != -1) {
-            for (topic.cgroups.items) |cg| {
-                cg.lock.lockUncancelable(io);
-                cg.offset -%= @intCast(min_offset);
-            }
-            for (0..@intCast(min_offset)) |_| {
-                _ = topic.mq.pop();
-            }
-            for (topic.cgroups.items) |cg| {
-                cg.lock.unlock(io);
-            }
-        }
-        topic.lock.unlock(io);
-    }
-}
-
-fn startConsumerGroupConsumption(topic: *Topic, cgroup: *CGroup, io: Io) void {
-    std.debug.print("Starting consumer group process, topicID = {}, groupID = {}\n", .{ topic.topicID, cgroup.groupID });
+fn readConsumerReadyAndSend(io: Io, _: *Topic, cgroup: *CGroup, consumer_conn: *ConsumerConn, partition_idx: usize) void {
     var stream_read_buff: [1024]u8 = undefined;
     var stream_write_buff: [1024]u8 = undefined;
+    var stream_rd = consumer_conn.stream.reader(io, &stream_read_buff);
+    var stream_wr = consumer_conn.stream.writer(io, &stream_write_buff);
+
     while (true) {
-        cgroup.lock.lockUncancelable(io);
-        const offset = cgroup.offset;
-        // Take message from topic for consumption
-        const pcm = topic.mq.peek(offset);
+        // Read ack if not ready
+        if (!consumer_conn.status) {
+            if (message_util.readMessageFromStream(&stream_rd) catch |err| {
+                std.debug.print("Error reading R_PCM from consumer: {}\n", .{err});
+                break;
+            }) |parsed_message| {
+                switch (parsed_message) {
+                    MessageType.R_PCM => {
+                        consumer_conn.status = true;
+                    },
+                    else => {
+                        std.debug.print("Parsed message not R_PCM: {any}\n", .{parsed_message});
+                        break;
+                    },
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Try to pop a message from any partition in this cgroup
+        const pcm = cgroup.partitions.items[partition_idx].queue.pop();
         if (pcm == null) {
-            cgroup.lock.unlock(io);
             continue;
         }
 
-        for (cgroup.consumers.items) |*consumer| {
-            if (consumer.status) {
-                var stream_rd = consumer.stream.reader(io, &stream_read_buff);
-                var stream_wr = consumer.stream.writer(io, &stream_write_buff);
-                // Write PCM message to ready consumer
-                consumer.status = false;
-                message_util.writeMessageToStream(&stream_wr, Message{
-                    .PCM = pcm.?,
-                }) catch |err| {
-                    std.debug.print("Error writing message to consumer: {}\n", .{err});
-                    consumer.status = false;
-
-                    continue;
-                };
-
-                // Read ack
-                if (message_util.readMessageFromStream(&stream_rd) catch |err| {
-                    std.debug.print("Error reading ack from consumer: {}\n", .{err});
-                    continue;
-                }) |parsed_message| {
-                    switch (parsed_message) {
-                        MessageType.R_PCM => {
-                            consumer.status = true;
-                        },
-                        else => {},
-                    }
-                    // Increase offset on consumed
-                    cgroup.offset += 1;
-                }
-            } else {
-                std.debug.print("No consumer is ready, size = {}\n", .{cgroup.consumers.items.len});
-            }
-        }
-        cgroup.lock.unlock(io);
+        // Write PCM message to ready consumer
+        consumer_conn.status = false;
+        message_util.writeMessageToStream(&stream_wr, Message{
+            .PCM = pcm.?,
+        }) catch |err| {
+            std.debug.print("Error writing message to consumer: {}\n", .{err});
+            continue;
+        };
     }
 }
 
@@ -255,7 +251,7 @@ fn connectAndReceiveProducer(io: Io, p_reg_message: ProducerRegisterMessage, bro
         if (try message_util.readMessageFromStream(&stream_rd)) |data| {
             switch (data) {
                 MessageType.PCM => |pcm| {
-                    const resp = try broker.processProducerPCM(pcm, topic);
+                    const resp = try broker.processProducerPCM(io, pcm, topic);
                     try message_util.writeMessageToStream(&stream_wr, message_util.Message{
                         .R_PCM = resp,
                     });

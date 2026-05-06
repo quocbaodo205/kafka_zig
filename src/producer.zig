@@ -80,4 +80,32 @@ pub const Producer = struct {
             }
         }
     }
+
+    pub fn startAndSimulateProducerServer(self: *Self, io: Io) !void {
+        // Create TCP server
+        const addr = try net.IpAddress.parse("127.0.0.1", self.port);
+        var server = try addr.listen(io, .{ .mode = .stream, .protocol = .tcp, .reuse_address = true });
+
+        try self.sendPortDataToBroker(io);
+
+        const stream = try server.accept(io); // Blocking until accepted
+
+        // Simulate sending messages
+        var stream_rd = stream.reader(io, &self.read_buffer);
+        var stream_wr = stream.writer(io, &self.write_buffer);
+        var time_buff: [100]u8 = undefined;
+        while (true) {
+            io.sleep(Io.Duration.fromSeconds(1), .boot) catch {};
+            const now = Io.Timestamp.now(io, .boot);
+            const line = try std.fmt.bufPrint(&time_buff, "Hello from producer {} at {d}", .{ self.port, Io.Timestamp.toMilliseconds(now) });
+            std.debug.print("Sent to broker: {s}\n", .{line});
+            try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+                .PCM = line,
+            });
+            // Try to read back from the stream
+            if (try message_util.readMessageFromStream(&stream_rd)) |data| {
+                std.debug.print("Receive R_PCM from broker: {}\n", .{data.R_PCM});
+            }
+        }
+    }
 };

@@ -60,18 +60,19 @@ pub const Consumer = struct {
         std.debug.print("Started consumer server, receiving...\n", .{});
 
         while (true) {
+            // Write R_PCM (Ready message) first
+            const resp: u8 = 1;
+            try message_util.writeMessageToStream(&stream_wr, message_util.Message{
+                .R_PCM = resp,
+            });
             // Read message to consume
             if (try message_util.readMessageFromStream(&stream_rd)) |message| {
                 switch (message) {
                     message_util.MessageType.PCM => |pcm| {
                         std.debug.print("Receive PCM from broker: {s}\n", .{pcm});
-                        // Sleep for 1 second like in Go example
-                        io.sleep(Io.Duration.fromSeconds(1), .boot) catch {};
-                        // Write R_PCM
-                        const resp: u8 = 1;
-                        try message_util.writeMessageToStream(&stream_wr, message_util.Message{
-                            .R_PCM = resp,
-                        });
+                        // Sleep for 2 seconds like in Go example
+                        io.sleep(Io.Duration.fromSeconds(2), .boot) catch {};
+                        // TODO: Do something with the message
                     },
                     else => {},
                 }

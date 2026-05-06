@@ -56,6 +56,14 @@ pub fn Queue(comptime message_size: comptime_int, comptime queue_max_size: compt
             return data;
         }
 
+        pub fn size(self: *const Self) u32 {
+            if (self.tail >= self.head) {
+                return (self.tail - self.head) / message_size;
+            } else {
+                return ((total_size - self.head) + self.tail) / message_size;
+            }
+        }
+
         pub fn debug(self: *Self) void {
             std.debug.print("Debug queue: \n", .{});
             var cur = self.head;
