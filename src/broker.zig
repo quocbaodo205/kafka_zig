@@ -7,7 +7,10 @@ const ConsumerRegisterMessage = message_util.ConsumerRegisterMessage;
 const Topic = @import("topic.zig").Topic;
 const CGroup = @import("cgroup.zig").CGroup;
 const ConsumerConn = @import("cgroup.zig").ConsumerConn;
+const Partition = @import("partition.zig").Partition;
 const Io = std.Io;
+const File = Io.File;
+const Dir = Io.Dir;
 const Allocator = std.mem.Allocator;
 const net = Io.net;
 
@@ -19,11 +22,68 @@ pub const Broker = struct {
     topics: std.ArrayList(*Topic),
     gpa: Allocator,
 
-    pub fn init(allocator: Allocator) !Self {
-        return Self{
-            .topics = try std.ArrayList(*Topic).initCapacity(allocator, 10),
-            .gpa = allocator,
+    meta_file: File,
+
+    pub fn init(io: Io, allocator: Allocator) !Self {
+        const cwd = Dir.cwd();
+
+        // Open or create broker metadata file
+        const meta_file = blk: {
+            const f = cwd.createFile(io, "broker_metadata.dat", .{ .read = true, .truncate = false }) catch |err| {
+                if (err == error.PathAlreadyExists) {
+                    break :blk try cwd.openFile(io, "broker_metadata.dat", .{ .mode = .read_write });
+                } else {
+                    return err;
+                }
+            };
+            break :blk f;
         };
+
+        // Ensure metadata file is at least 4 bytes (topic count as u32)
+        const meta_len = try meta_file.length(io);
+        if (meta_len < 4) {
+            var buf: [4]u8 = .{0} ** 4;
+            try meta_file.writePositionalAll(io, &buf, 0);
+        }
+
+        // Read topic count from metadata file
+        var count_buf: [4]u8 = undefined;
+        _ = try meta_file.readPositionalAll(io, &count_buf, 0);
+        const topic_count = std.mem.readInt(u32, &count_buf, .big);
+
+        var topics = try std.ArrayList(*Topic).initCapacity(allocator, 10);
+
+        // Restore topics from metadata
+        if (topic_count > 0) {
+            for (0..topic_count) |i| {
+                var topic_id_buf: [2]u8 = undefined;
+                _ = try meta_file.readPositionalAll(io, &topic_id_buf, 4 + i * 2);
+                const topic_id = std.mem.readInt(u16, &topic_id_buf, .big);
+                const tp = try allocator.create(Topic);
+                tp.* = try Topic.init(io, topic_id, allocator);
+                try topics.append(allocator, tp);
+            }
+        }
+
+        std.debug.print("debug metadata file name = broker_metadata.dat: topics = {d}\n", .{topic_count});
+
+        return Self{
+            .topics = topics,
+            .gpa = allocator,
+            .meta_file = meta_file,
+        };
+    }
+
+    pub fn store(self: *Self, io: Io) !void {
+        var count_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &count_buf, @intCast(self.topics.items.len), .big);
+        try self.meta_file.writePositionalAll(io, &count_buf, 0);
+        for (self.topics.items, 0..) |tp, i| {
+            var topic_id_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &topic_id_buf, tp.topicID, .big);
+            try self.meta_file.writePositionalAll(io, &topic_id_buf, 4 + i * 2);
+        }
+        std.debug.print("debug metadata file name = broker_metadata.dat: topics = {d}\n", .{self.topics.items.len});
     }
 
     /// Main function to start an admin server and wait for a message
@@ -57,7 +117,7 @@ pub const Broker = struct {
     fn processProducerPCM(_: *Self, io: Io, pcm: []const u8, topic: *Topic) !u8 {
         // If there are no cgroups yet, store in topic's mq
         if (topic.cgroups.items.len == 0) {
-            topic.mq.push(pcm);
+            topic.mq.push(io, pcm);
             return 0;
         }
 
@@ -77,11 +137,11 @@ pub const Broker = struct {
                 defer target_partition.lock.unlock(io);
 
                 // First, dump all messages from topic's mq to this partition
-                while (topic.mq.pop()) |msg_from_mq| {
-                    target_partition.queue.push(msg_from_mq);
+                while (topic.mq.pop(io)) |msg_from_mq| {
+                    target_partition.queue.push(io, msg_from_mq);
                 }
 
-                target_partition.queue.push(pcm);
+                target_partition.queue.push(io, pcm);
             }
         }
 
@@ -133,8 +193,9 @@ pub const Broker = struct {
         }
         if (topic == null) {
             const tp = try self.gpa.create(Topic);
-            tp.* = try Topic.init(p_reg_message.topicID, self.gpa);
+            tp.* = try Topic.init(io, p_reg_message.topicID, self.gpa);
             try self.topics.append(self.gpa, tp);
+            try self.store(io);
             topic = tp;
         }
         // Connect to it concurrently and process
@@ -153,8 +214,9 @@ pub const Broker = struct {
         }
         if (topic == null) {
             const tp = try self.gpa.create(Topic);
-            tp.* = try Topic.init(c_reg_message.topicID, self.gpa);
+            tp.* = try Topic.init(io, c_reg_message.topicID, self.gpa);
             try self.topics.append(self.gpa, tp);
+            try self.store(io);
             topic = tp;
         }
         var cgroup: ?*CGroup = null;
@@ -168,8 +230,9 @@ pub const Broker = struct {
         }
         if (cgroup == null) {
             const cg = try self.gpa.create(CGroup);
-            cg.* = try CGroup.init(self.gpa, c_reg_message.groupID);
+            cg.* = try CGroup.init(io, self.gpa, c_reg_message.topicID, c_reg_message.groupID);
             try topic.?.cgroups.append(self.gpa, cg);
+            try topic.?.store(io);
             cgroup = cg;
         }
         // Now connect to consumer and add to cgroup
@@ -185,7 +248,9 @@ pub const Broker = struct {
         defer cgroup.?.lock.unlock(io);
         try cgroup.?.consumer_conn.append(self.gpa, consumer_ptr);
         if (cgroup.?.partitions.items.len < cgroup.?.consumer_conn.items.len) {
-            try cgroup.?.partitions.append(self.gpa, @import("partition.zig").Partition.init());
+            const new_partition_id: u16 = @intCast(cgroup.?.partitions.items.len + 1);
+            try cgroup.?.partitions.append(self.gpa, try Partition.init(io, c_reg_message.topicID, c_reg_message.groupID, new_partition_id));
+            try cgroup.?.store(io);
         }
         std.debug.print("Starting readConsumerReadyAndSend for group {} partition {}\n", .{ cgroup.?.groupID, cgroup.?.partitions.items.len - 1 });
         _ = try io.concurrent(readConsumerReadyAndSend, .{ io, topic.?, cgroup.?, consumer_ptr, cgroup.?.partitions.items.len - 1 });
@@ -221,7 +286,7 @@ fn readConsumerReadyAndSend(io: Io, _: *Topic, cgroup: *CGroup, consumer_conn: *
         }
 
         // Try to pop a message from any partition in this cgroup
-        const pcm = cgroup.partitions.items[partition_idx].queue.pop();
+        const pcm = cgroup.partitions.items[partition_idx].queue.pop(io);
         if (pcm == null) {
             continue;
         }
