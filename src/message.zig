@@ -2,6 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const Allocator = std.mem.Allocator;
 
 pub const ProducerRegisterMessage = struct {
     port: u16,
@@ -81,7 +82,7 @@ pub const Message = union(MessageType) {
 /// Parse the message with the following format:
 /// - First byte is the message type
 /// - The remaining is the message content.
-fn parseMessage(message: []u8) ?Message {
+pub fn parseMessage(message: []u8) ?Message {
     switch (message[0]) {
         @intFromEnum(MessageType.ECHO) => {
             return Message{ .ECHO = message[1..] };
@@ -143,6 +144,52 @@ fn writeDataToStreamWithType(stream_wr: *net.Stream.Writer, mtype: u8, data: []c
     try stream_wr.interface.writeByte(mtype); // Send the type
     try stream_wr.interface.writeAll(data);
     try stream_wr.interface.flush();
+}
+
+fn encodeToBuffer(gpa: Allocator, mtype: u8, data: []const u8) ![]u8 {
+    // Wire format: [len = data.len + 1][mtype][data...]
+    const buf = try gpa.alloc(u8, data.len + 2);
+    buf[0] = @intCast(data.len + 1);
+    buf[1] = mtype;
+    @memcpy(buf[2..], data);
+    return buf;
+}
+
+/// Serialize `message` into a newly allocated buffer using `gpa`.
+/// The returned slice uses the same wire format as `writeMessageToStream`
+/// and is owned by the caller, who is responsible for freeing it.
+pub fn messageToBuffer(gpa: Allocator, message: Message) ![]u8 {
+    switch (message) {
+        MessageType.ECHO => |data| {
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.ECHO), data);
+        },
+        MessageType.P_REG => |data| {
+            const bytes = data.toByte();
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.P_REG), &bytes);
+        },
+        MessageType.C_REG => |data| {
+            const bytes = data.toByte();
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.C_REG), &bytes);
+        },
+        MessageType.PCM => |data| {
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.PCM), data);
+        },
+        MessageType.R_ECHO => |data| {
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.R_ECHO), data);
+        },
+        MessageType.R_P_REG => |ack_byte| {
+            const data: [1]u8 = .{ack_byte};
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.R_P_REG), &data);
+        },
+        MessageType.R_C_REG => |ack_byte| {
+            const data: [1]u8 = .{ack_byte};
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.R_C_REG), &data);
+        },
+        MessageType.R_PCM => |ack_byte| {
+            const data: [1]u8 = .{ack_byte};
+            return try encodeToBuffer(gpa, @intFromEnum(MessageType.R_PCM), &data);
+        },
+    }
 }
 
 /// Write a message to the stream

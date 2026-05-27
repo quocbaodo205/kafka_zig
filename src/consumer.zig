@@ -70,8 +70,7 @@ pub const Consumer = struct {
                 switch (message) {
                     message_util.MessageType.PCM => |pcm| {
                         std.debug.print("Receive PCM from broker: {s}\n", .{pcm});
-                        // Sleep for 2 seconds like in Go example
-                        io.sleep(Io.Duration.fromSeconds(2), .boot) catch {};
+                        io.sleep(Io.Duration.fromMilliseconds(1500), .boot) catch {};
                         // TODO: Do something with the message
                     },
                     else => {},

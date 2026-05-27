@@ -8,7 +8,13 @@ const Partition = @import("partition.zig").Partition;
 
 pub const ConsumerConn = struct {
     status: bool,
-    stream: net.Stream,
+    // Used by the Io-based (non-Linux) broker. The io_uring broker leaves
+    // this field as `undefined` and reads/writes via `fd` instead.
+    stream: net.Stream = undefined,
+    // io_uring broker only: raw socket fd for this consumer, plus the
+    // index of the partition this consumer is assigned to within its cgroup.
+    fd: i32 = -1,
+    partition_idx: usize = 0,
 };
 
 pub const CGroup = struct {
